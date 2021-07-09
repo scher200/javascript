@@ -1,10 +1,10 @@
 import execa = require('execa');
 import fs = require('fs');
 import https = require('https');
+import yaml = require('js-yaml');
 import net = require('net');
 import path = require('path');
 
-import yaml = require('js-yaml');
 import request = require('request');
 import shelljs = require('shelljs');
 
@@ -157,7 +157,7 @@ export class KubeConfig {
     }
 
     public loadFromString(config: string, opts?: Partial<ConfigOptions>): void {
-        const obj = yaml.safeLoad(config);
+        const obj = yaml.load(config) as any;
         this.clusters = newClusters(obj.clusters, opts);
         this.contexts = newContexts(obj.contexts, opts);
         this.users = newUsers(obj.users, opts);
@@ -302,11 +302,26 @@ export class KubeConfig {
             }
         }
         if (process.platform === 'win32' && shelljs.which('wsl.exe')) {
-            // TODO: Handle if someome set $KUBECONFIG in wsl here...
             try {
-                const result = execa.sync('wsl.exe', ['cat', shelljs.homedir() + '/.kube/config']);
-                if (result.code === 0) {
-                    this.loadFromString(result.std, opts);
+                const envKubeconfigPathResult = execa.sync('wsl.exe', ['bash', '-ic', 'printenv KUBECONFIG']);
+                if (envKubeconfigPathResult.exitCode === 0 && envKubeconfigPathResult.stdout.length > 0) {
+                    const result = execa.sync('wsl.exe', ['cat', envKubeconfigPathResult.stdout]);
+                    if (result.exitCode === 0) {
+                        this.loadFromString(result.stdout, opts);
+                        return;
+                    }
+                    if (result.exitCode === 0) {
+                        this.loadFromString(result.stdout, opts);
+                        return;
+                    }
+                }
+            } catch (err) {
+                // Falling back to default kubeconfig
+            }
+            try {
+                const result = execa.sync('wsl.exe', ['cat', '~/.kube/config']);
+                if (result.exitCode === 0) {
+                    this.loadFromString(result.stdout, opts);
                     return;
                 }
             } catch (err) {
