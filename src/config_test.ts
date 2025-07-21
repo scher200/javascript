@@ -1,29 +1,29 @@
 import { readFileSync } from 'fs';
 import * as https from 'https';
-import { dirname, join } from 'path';
+import { join } from 'path';
 
 import { expect } from 'chai';
 import mockfs = require('mock-fs');
 import * as path from 'path';
 import * as requestlib from 'request';
 
-import * as filesystem from 'fs';
-import { fs } from 'mock-fs';
-import * as os from 'os';
 import { CoreV1Api } from './api';
 import { bufferFromFileOrString, findHomeDir, findObject, KubeConfig, makeAbsolutePath } from './config';
 import { Cluster, newClusters, newContexts, newUsers, User, ActionOnInvalid } from './config_types';
-import { isUndefined } from 'util';
+import { ExecAuth } from './exec_auth';
+import { request } from 'http';
 
 const kcFileName = 'testdata/kubeconfig.yaml';
 const kc2FileName = 'testdata/kubeconfig-2.yaml';
 const kcDupeCluster = 'testdata/kubeconfig-dupe-cluster.yaml';
 const kcDupeContext = 'testdata/kubeconfig-dupe-context.yaml';
 const kcDupeUser = 'testdata/kubeconfig-dupe-user.yaml';
+const kcProxyUrl = 'testdata/kubeconfig-proxy-url.yaml';
 
 const kcNoUserFileName = 'testdata/empty-user-kubeconfig.yaml';
 const kcInvalidContextFileName = 'testdata/empty-context-kubeconfig.yaml';
 const kcInvalidClusterFileName = 'testdata/empty-cluster-kubeconfig.yaml';
+const kcTlsServerNameFileName = 'testdata/tls-server-name-kubeconfig.yaml';
 
 /* tslint:disable: no-empty */
 describe('Config', () => {});
@@ -37,6 +37,7 @@ function validateFileLoad(kc: KubeConfig) {
     expect(cluster1.name).to.equal('cluster1');
     expect(cluster1.caData).to.equal('Q0FEQVRB');
     expect(cluster1.server).to.equal('http://example.com');
+    expect(cluster1.proxyUrl).to.equal('socks5://localhost:1181');
     expect(cluster2.name).to.equal('cluster2');
     expect(cluster2.caData).to.equal('Q0FEQVRBMg==');
     expect(cluster2.server).to.equal('http://example2.com');
@@ -153,6 +154,93 @@ describe('KubeConfig', () => {
         });
     });
 
+    describe('loadFromCluster', () => {
+        let originalTokenPath: string | undefined;
+        let originalCaFilePath: string | undefined;
+
+        before(() => {
+            originalTokenPath = process.env['TOKEN_FILE_PATH'];
+            originalCaFilePath = process.env['KUBERNETES_CA_FILE_PATH'];
+
+            delete process.env['TOKEN_FILE_PATH'];
+            delete process.env['KUBERNETES_CA_FILE_PATH'];
+        });
+
+        after(() => {
+            delete process.env['TOKEN_FILE_PATH'];
+            delete process.env['KUBERNETES_CA_FILE_PATH'];
+
+            if (originalTokenPath) {
+                process.env['TOKEN_FILE_PATH'] = originalTokenPath;
+            }
+
+            if (originalCaFilePath) {
+                process.env['KUBERNETES_CA_FILE_PATH'] = originalCaFilePath;
+            }
+        });
+
+        it('should load from default env vars', () => {
+            const kc = new KubeConfig();
+            const cluster = {
+                name: 'inCluster',
+                server: 'https://undefined:undefined',
+                skipTLSVerify: false,
+                caFile: '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+            } as Cluster;
+
+            const user = {
+                authProvider: {
+                    name: 'tokenFile',
+                    config: {
+                        tokenFile: '/var/run/secrets/kubernetes.io/serviceaccount/token',
+                    },
+                },
+                name: 'inClusterUser',
+            } as User;
+
+            kc.loadFromCluster();
+
+            const clusterOut = kc.getCurrentCluster();
+
+            expect(cluster).to.deep.equals(clusterOut);
+
+            const userOut = kc.getCurrentUser();
+            expect(userOut).to.deep.equals(user);
+        });
+
+        it('should support custom token file path', () => {
+            const kc = new KubeConfig();
+            process.env['TOKEN_FILE_PATH'] = '/etc/tokenFile';
+            process.env['KUBERNETES_CA_FILE_PATH'] = '/etc/ca.crt';
+
+            const cluster = {
+                name: 'inCluster',
+                server: 'https://undefined:undefined',
+                skipTLSVerify: false,
+                caFile: '/etc/ca.crt',
+            } as Cluster;
+
+            const user = {
+                authProvider: {
+                    name: 'tokenFile',
+                    config: {
+                        tokenFile: '/etc/tokenFile',
+                    },
+                },
+                name: 'inClusterUser',
+            } as User;
+
+            kc.loadFromCluster();
+
+            const clusterOut = kc.getCurrentCluster();
+
+            expect(cluster).to.deep.equals(clusterOut);
+
+            const userOut = kc.getCurrentUser();
+            expect(userOut).to.deep.equals(user);
+        });
+    });
+
     describe('clusterConstructor', () => {
         it('should load from options', () => {
             const cluster = {
@@ -197,6 +285,12 @@ describe('KubeConfig', () => {
             const kc = new KubeConfig();
             expect(kc.loadFromFile.bind('missing.yaml')).to.throw();
         });
+        it('should load tls server name', () => {
+            const kc = new KubeConfig();
+            kc.loadFromFile(kcTlsServerNameFileName);
+            expect(kc.getClusters()[0].tlsServerName).to.equal('kube.example2.com');
+            expect(kc.getClusters()[1].tlsServerName).to.be.undefined;
+        });
 
         describe('filter vs throw tests', () => {
             it('works for invalid users', () => {
@@ -236,18 +330,57 @@ describe('KubeConfig', () => {
     });
 
     describe('applyHTTPSOptions', () => {
+        it('should apply tls-server-name to https.RequestOptions', async () => {
+            const kc = new KubeConfig();
+            kc.loadFromFile(kcTlsServerNameFileName);
+
+            const opts: https.RequestOptions = {};
+            await kc.applyToHTTPSOptions(opts);
+
+            expect(opts).to.deep.equal({
+                headers: {},
+                ca: Buffer.from('CADATA2', 'utf-8'),
+                cert: Buffer.from('USER_CADATA', 'utf-8'),
+                key: Buffer.from('USER_CKDATA', 'utf-8'),
+                rejectUnauthorized: false,
+                servername: 'kube.example2.com',
+            });
+        });
+        it('should apply tls-server-name to request.Options', async () => {
+            const kc = new KubeConfig();
+            kc.loadFromFile(kcTlsServerNameFileName);
+
+            const opts: requestlib.Options = {
+                url: 'https://company.com',
+                agentOptions: {} as https.AgentOptions,
+            };
+            await kc.applyToRequest(opts);
+
+            expect(opts).to.deep.equal({
+                url: 'https://company.com',
+                headers: {},
+                ca: Buffer.from('CADATA2', 'utf-8'),
+                cert: Buffer.from('USER_CADATA', 'utf-8'),
+                key: Buffer.from('USER_CKDATA', 'utf-8'),
+                rejectUnauthorized: false,
+                strictSSL: false,
+                agentOptions: {
+                    servername: 'kube.example2.com',
+                },
+            });
+        });
         it('should apply cert configs', () => {
             const kc = new KubeConfig();
             kc.loadFromFile(kcFileName);
 
             const opts: https.RequestOptions = {};
-            kc.applytoHTTPSOptions(opts);
+            kc.applyToHTTPSOptions(opts);
 
             expect(opts).to.deep.equal({
                 headers: {},
-                ca: new Buffer('CADATA2', 'utf-8'),
-                cert: new Buffer('USER2_CADATA', 'utf-8'),
-                key: new Buffer('USER2_CKDATA', 'utf-8'),
+                ca: Buffer.from('CADATA2', 'utf-8'),
+                cert: Buffer.from('USER2_CADATA', 'utf-8'),
+                key: Buffer.from('USER2_CKDATA', 'utf-8'),
                 rejectUnauthorized: false,
             });
         });
@@ -262,7 +395,7 @@ describe('KubeConfig', () => {
             await kc.applyToRequest(opts);
             expect(opts).to.deep.equal({
                 headers: {},
-                ca: new Buffer('CADATA2', 'utf-8'),
+                ca: Buffer.from('CADATA2', 'utf-8'),
                 auth: {
                     username: 'foo',
                     password: 'bar',
@@ -271,6 +404,30 @@ describe('KubeConfig', () => {
                 strictSSL: false,
                 rejectUnauthorized: false,
             });
+        });
+        it('should apply proxy to request.Options', async () => {
+            const kc = new KubeConfig();
+            kc.loadFromFile(kc2FileName);
+
+            const opts = {} as requestlib.Options;
+
+            await kc.applyToRequest(opts);
+
+            expect(opts).to.deep.equal({
+                headers: {},
+                ca: Buffer.from('CADAT@', 'utf-8'),
+                cert: Buffer.from(']SER_CADATA', 'utf-8'),
+                key: Buffer.from(']SER_CKDATA', 'utf-8'),
+                proxy: 'https://localhost:1181',
+            });
+        });
+        it('should apply agent to request.Options', async () => {
+            const kc = new KubeConfig();
+            kc.loadFromFile(kcProxyUrl);
+
+            const opts = {} as requestlib.Options;
+            await kc.applyToRequest(opts);
+            expect(opts.agent).to.exist;
         });
     });
 
@@ -464,39 +621,134 @@ describe('KubeConfig', () => {
             process.env.HOMEPATH = originalEnvVars.HOMEPATH;
         });
 
-        it('should return null if no home is present', () => {
+        it('should return null if no home-ish env vars are set', () => {
             const dir = findHomeDir();
             expect(dir).to.equal(null);
         });
 
-        it('should load from HOMEDRIVE/HOMEPATH if present', () => {
-            process.env.HOMEDRIVE = 'foo';
-            process.env.HOMEPATH = 'bar';
-            const dir = join(process.env.HOMEDRIVE, process.env.HOMEPATH);
-            const arg = {};
-            arg[dir] = { config: 'data' };
-            mockfs(arg);
+        describe('look for an existing .kube/config', () => {
+            let allDirs;
+            let homeDrive;
+            beforeEach(() => {
+                allDirs = {};
+                process.env.HOME = 'home';
+                process.env.HOMEDRIVE = 'drive';
+                process.env.HOMEPATH = 'a-path';
+                process.env.USERPROFILE = 'a-userprofile';
+                homeDrive = join(process.env.HOMEDRIVE, process.env.HOMEPATH);
+                allDirs[process.env.HOME] = {};
+                allDirs[homeDrive] = {};
+                allDirs[process.env.USERPROFILE] = {};
+            });
+            it('should load from HOME if present', () => {
+                const dir = process.env.HOME as string;
+                allDirs[dir]['.kube'] = { config: 'data' };
+                mockfs(allDirs);
 
-            const home = findHomeDir();
+                const home = findHomeDir();
 
-            mockfs.restore();
-            expect(home).to.equal(dir);
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
+            it('should favor HOME when present', () => {
+                const dir = process.env.HOME as string;
+                allDirs[dir]['.kube'] = { config: 'data' };
+                allDirs[homeDrive]['.kube'] = { config: 'data' };
+                allDirs[process.env.USERPROFILE as string]['.kube'] = { config: 'data' };
+                mockfs(allDirs);
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
+
+            it('should load from HOMEDRIVE/HOMEPATH if present', () => {
+                const dir = homeDrive;
+                allDirs[dir]['.kube'] = { config: 'data' };
+                mockfs(allDirs);
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
+
+            it('should favor HOMEDRIVE/HOMEPATH over USERPROFILE', () => {
+                const dir = homeDrive;
+                allDirs[dir]['.kube'] = { config: 'data' };
+                allDirs[process.env.USERPROFILE as string]['.kube'] = { config: 'data' };
+                mockfs(allDirs);
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
+
+            it('should load from USERPROFILE if present', () => {
+                const dir = process.env.USERPROFILE as string;
+                allDirs[dir]['.kube'] = { config: 'data' };
+                mockfs(allDirs);
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
         });
 
-        it('should load from USERPROFILE if present', () => {
-            const dir = 'someplace';
+        // Just test for existence,but this will include the writeability order
+        describe('look for an existing directory', () => {
+            let allDirs;
+            let homeDrive;
+            beforeEach(() => {
+                allDirs = {};
+                process.env.HOME = 'home';
+                process.env.HOMEDRIVE = 'drive';
+                process.env.HOMEPATH = 'a-path';
+                process.env.USERPROFILE = 'a-userprofile';
+                homeDrive = join(process.env.HOMEDRIVE, process.env.HOMEPATH);
+            });
+            it('should load from HOME if present', () => {
+                allDirs[process.env.HOME as string] = 'data';
+                allDirs[homeDrive] = 'data';
+                allDirs[process.env.USERPROFILE as string] = 'data';
+                const dir = process.env.HOME;
+                mockfs(allDirs);
 
-            process.env.HOMEDRIVE = 'foo';
-            process.env.HOMEPATH = 'bar';
-            process.env.USERPROFILE = dir;
-            const arg = {};
-            arg[dir] = { config: 'data' };
-            mockfs(arg);
+                const home = findHomeDir();
 
-            const home = findHomeDir();
+                mockfs.restore();
+                expect(home).to.equal(dir);
+            });
+            it('should load from USERPROFILE if present', () => {
+                allDirs[homeDrive] = 'data';
+                allDirs[process.env.USERPROFILE as string] = 'data';
+                mockfs(allDirs);
 
-            mockfs.restore();
-            expect(home).to.equal(dir);
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(process.env.USERPROFILE);
+            });
+            it('should load from homeDrive if present', () => {
+                allDirs[homeDrive] = 'data';
+                mockfs(allDirs);
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(homeDrive);
+            });
+            it('should return HOME when no home-ish directories are present', () => {
+                mockfs({});
+
+                const home = findHomeDir();
+
+                mockfs.restore();
+                expect(home).to.equal(process.env.HOME);
+            });
         });
     });
 
@@ -562,7 +814,7 @@ describe('KubeConfig', () => {
 
             config.loadFromClusterAndUser({} as Cluster, { username: user, password: passwd } as User);
             const opts = {} as https.RequestOptions;
-            await config.applytoHTTPSOptions(opts);
+            await config.applyToHTTPSOptions(opts);
 
             expect(opts.auth).to.equal(`${user}:${passwd}`);
         });
@@ -781,6 +1033,38 @@ describe('KubeConfig', () => {
                 expect(opts.headers.Authorization).to.equal(`Bearer ${token}`);
             }
         });
+
+        it('should exec with expired token', async () => {
+            // TODO: fix this test for Windows
+            if (process.platform === 'win32') {
+                return;
+            }
+            const config = new KubeConfig();
+            const token = 'token';
+            const responseStr = `{"token":{"accessToken":"${token}"}}`;
+            config.loadFromClusterAndUser(
+                { skipTLSVerify: false } as Cluster,
+                {
+                    authProvider: {
+                        name: 'azure',
+                        config: {
+                            'expires-on': '1590757517834',
+                            'cmd-path': 'echo',
+                            'cmd-args': `'${responseStr}'`,
+                            'token-key': '{.token.accessToken}',
+                            'expiry-key': '{.token.token_expiry}',
+                        },
+                    },
+                } as User,
+            );
+            const opts = {} as requestlib.Options;
+            await config.applyToRequest(opts);
+            expect(opts.headers).to.not.be.undefined;
+            if (opts.headers) {
+                expect(opts.headers.Authorization).to.equal(`Bearer ${token}`);
+            }
+        });
+
         it('should exec without access-token', async () => {
             // TODO: fix this test for Windows
             if (process.platform === 'win32') {
@@ -998,9 +1282,10 @@ describe('KubeConfig', () => {
             // TODO: inject the exec command here?
             const opts = {} as requestlib.Options;
             await config.applyToRequest(opts);
-            expect((KubeConfig as any).authenticators[1].tokenCache['exec']).to.deep.equal(
-                JSON.parse(responseStr),
+            let execAuthenticator = (config as any).authenticators.find(
+                (authenticator) => authenticator instanceof ExecAuth,
             );
+            expect(execAuthenticator.tokenCache['exec']).to.deep.equal(JSON.parse(responseStr));
         });
 
         it('should throw with no command.', () => {
@@ -1151,10 +1436,12 @@ describe('KubeConfig', () => {
             }
             const token = 'token';
             const cert = 'cert';
+            const namespace = 'myNamespace';
             mockfs({
                 '/var/run/secrets/kubernetes.io/serviceaccount': {
                     'ca.crt': cert,
                     token,
+                    namespace,
                 },
             });
 
@@ -1180,6 +1467,12 @@ describe('KubeConfig', () => {
                 expect(user.authProvider.config.tokenFile).to.equal(
                     '/var/run/secrets/kubernetes.io/serviceaccount/token',
                 );
+            }
+            const contextName = kc.getCurrentContext();
+            const currentContext = kc.getContextObject(contextName);
+            expect(currentContext).to.not.be.null;
+            if (currentContext) {
+                expect(currentContext.namespace).to.equal('myNamespace');
             }
         });
 

@@ -2,8 +2,8 @@
   "compilerOptions": {
     "module": "commonjs",
     "noImplicitAny": false,
-    "suppressImplicitAnyIndexErrors": true,
-    "target": "es6",
+    "target": "es2019",
+    "lib": ["es2020"],
     "moduleResolution": "node",
     "removeComments": false,
     "sourceMap": true,
@@ -14,9 +14,8 @@
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "importHelpers": true,
-    "skipLibCheck": true
-    // enable this when it works with tslint, or we switch to prettier
-    // "declarationMap": true
+    "skipLibCheck": true,
+    "esModuleInterop": true
   },
   "exclude": [
     "node_modules",

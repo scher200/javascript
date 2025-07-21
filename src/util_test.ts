@@ -1,6 +1,6 @@
-import { expect } from 'chai';
+import { expect, should } from 'chai';
 import { CoreV1Api, V1Container, V1Pod } from './api';
-import { podsForNode, quantityToScalar, totalCPU, totalMemory } from './util';
+import { findSuffix, podsForNode, quantityToScalar, totalCPU, totalMemory } from './util';
 
 describe('Utils', () => {
     it('should get zero pods for a node', async () => {
@@ -54,14 +54,35 @@ describe('Utils', () => {
     it('should parse quantities', () => {
         expect(quantityToScalar('')).to.equal(0);
 
+        expect(quantityToScalar('2n')).to.equal(2 / 1_000_000_000);
+        expect(quantityToScalar('3u')).to.equal(3 / 1_000_000);
         expect(quantityToScalar('100m')).to.equal(0.1);
+        expect(quantityToScalar('3k')).to.equal(BigInt(3000));
+        expect(quantityToScalar('3M')).to.equal(BigInt(3 * 1000 * 1000));
+        expect(quantityToScalar('3G')).to.equal(BigInt(3 * 1000 * 1000 * 1000));
+        expect(quantityToScalar('5T')).to.equal(BigInt(5 * 1000 * 1000 * 1000) * BigInt(1000));
+        expect(quantityToScalar('3P')).to.equal(BigInt(3 * 1000 * 1000 * 1000) * BigInt(1000 * 1000));
+        expect(quantityToScalar('14E')).to.equal(
+            BigInt(14 * 1000 * 1000 * 1000) * BigInt(1000 * 1000 * 1000),
+        );
+
+        expect(quantityToScalar('0.2')).to.equal(0.2);
         expect(quantityToScalar('1976m')).to.equal(1.976);
 
-        expect(quantityToScalar('10Ki')).to.equal(10240);
-
         expect(quantityToScalar('1024')).to.equal(1024);
+        expect(quantityToScalar('10e3')).to.equal(10000);
+
+        expect(quantityToScalar('10Ki')).to.equal(BigInt(10240));
+        expect(quantityToScalar('20Mi')).to.equal(BigInt(1024 * 1024 * 20));
+        expect(quantityToScalar('30Gi')).to.equal(BigInt(1024 * 1024 * 1024 * 30));
+        expect(quantityToScalar('40Ti')).to.equal(BigInt(1024 * 1024 * 1024 * 1024 * 40));
+        expect(quantityToScalar('50Pi')).to.equal(BigInt(1024 * 1024 * 1024 * 1024 * 1024 * 50));
+        expect(quantityToScalar('60Ei')).to.equal(
+            BigInt(1024 * 1024 * 1024) * BigInt(1024 * 1024 * 1024 * 60),
+        );
 
         expect(() => quantityToScalar('foobar')).to.throw('Unknown quantity foobar');
+        expect(() => quantityToScalar('100foobar')).to.throw('Unknown suffix: foobar');
     });
 
     it('should get resources for pod', () => {
@@ -100,7 +121,13 @@ describe('Utils', () => {
         expect(cpuResult.limit).to.equal(0.2);
 
         const memResult = totalMemory(pod);
-        expect(memResult.request).to.equal(10240);
-        expect(memResult.limit).to.equal(20480);
+        expect(memResult.request).to.equal(BigInt(10240));
+        expect(memResult.limit).to.equal(BigInt(20480));
+    });
+
+    it('should find the suffix correctly', () => {
+        expect(findSuffix('1234567')).to.equal('');
+        expect(findSuffix('1234asdf')).to.equal('asdf');
+        expect(findSuffix('1.0')).to.equal('');
     });
 });

@@ -13,6 +13,7 @@ export interface WatchUpdate {
 export interface RequestResult {
     pipe(stream: Duplex): void;
     on(ev: string, cb: (arg: any) => void): void;
+    removeAllListeners(ev: string): void;
     abort(): void;
 }
 
@@ -47,7 +48,9 @@ export class DefaultRequest implements RequestInterface {
             if (resp.statusCode === 200) {
                 req.resume();
             } else {
-                req.emit('error', new Error(resp.statusMessage));
+                const error = new Error(resp.statusMessage) as Error & { statusCode: number | undefined };
+                error.statusCode = resp.statusCode;
+                req.emit('error', error);
             }
         });
         return req;
@@ -100,7 +103,7 @@ export class Watch {
         };
         await this.config.applyToRequest(requestOptions);
 
-        let req;
+        let req: RequestResult;
         let doneCalled: boolean = false;
         const doneCallOnce = (err: any) => {
             if (!doneCalled) {
@@ -119,12 +122,16 @@ export class Watch {
         stream.on('error', doneCallOnce);
         stream.on('close', () => doneCallOnce(null));
         stream.on('data', (line) => {
+            let data: { type: string; object: any };
+
             try {
-                const data = JSON.parse(line);
-                callback(data.type, data.object, data);
+                data = JSON.parse(line);
             } catch (ignore) {
                 // ignore parse errors
+                return;
             }
+
+            callback(data.type, data.object, data);
         });
 
         req.pipe(stream);
